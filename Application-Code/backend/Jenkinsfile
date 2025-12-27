@@ -1,0 +1,190 @@
+pipeline {
+    agent any
+
+    tools {
+        nodejs 'nodejs'
+        jdk 'jdk17'
+    }
+
+    environment {
+        BACKEND_DIR      = 'Application-Code/backend'
+
+        SCANNER_HOME     = tool 'sonar-scanner'
+        SONAR_PROJECT_KEY= 'nodejs-backend'
+        SONAR_HOST_URL   = 'http://4.211.251.176:9000'
+
+        NEXUS_URL        = 'http://4.211.251.176:8081'
+        NEXUS_REPO       = 'nodejs-releases'
+
+        IMAGE_NAME       = 'nodejs-backend'
+        ACR_NAME         = 'bonjour10.azurecr.io'
+        IMAGE_TAG        = "${BUILD_NUMBER}"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'githubcred5',
+                    url: 'https://github.com/mouradaouraghe/End-to-End-Kubernetes-Three-Tier-DevSecOps-Project.git'
+            }
+        }
+
+        stage('Install Dependencies (Backend)') {
+            steps {
+                dir("${BACKEND_DIR}") {
+                    sh 'npm install'
+                }
+            }
+        }
+
+        stage('Test Backend') {
+            steps {
+                dir("${BACKEND_DIR}") {
+                    sh 'npm test'
+                }
+            }
+        }
+        stage('Prepare Trivy Templates') {
+    steps {
+        sh '''
+        mkdir -p trivy-templates
+        curl -sSL \
+          https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl \
+          -o trivy-templates/html.tpl
+        '''
+    }
+}
+
+       stage('Trivy FS Scan (Backend)') {
+    steps {
+        sh """
+        trivy fs ${BACKEND_DIR} \
+          --severity HIGH,CRITICAL \
+          --scanners vuln \
+          --format template \
+          --template trivy-templates/html.tpl \
+          -o trivy-fs-backend.html
+        """
+    }
+}
+
+
+        stage('SonarQube Backend') {
+            steps {
+                dir("${BACKEND_DIR}") {
+                    withSonarQubeEnv('sonar') {
+                        sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=. \
+                          -Dsonar.exclusions=node_modules/** \
+                          -Dsonar.host.url=${SONAR_HOST_URL}
+                        """
+                    }
+                }
+            }
+        }
+stage('OWASP Dependency-Check (Backend)') {
+    steps {
+        dir("${BACKEND_DIR}") {
+            dependencyCheck(
+                odcInstallation: 'DP-Check',
+                additionalArguments: '''
+                    --scan .
+                    --format XML
+                    --format HTML
+                    --disableYarnAudit
+                    --disableNodeAudit
+                '''
+            )
+
+            dependencyCheckPublisher(
+                pattern: '**/dependency-check-report.xml'
+            )
+        }
+    }
+}
+
+
+
+
+
+
+       stage('Build Backend Artifact') {
+    steps {
+        dir("${BACKEND_DIR}") {
+            sh '''
+            rm -rf /tmp/backend-build
+            mkdir -p /tmp/backend-build
+            rsync -av \
+              --exclude=node_modules \
+              --exclude=dependency-check-report \
+              --exclude=trivy-* \
+              ./ /tmp/backend-build/
+
+            tar -czf nodejs-backend-${BUILD_NUMBER}.tar.gz -C /tmp/backend-build .
+            '''
+        }
+    }
+}
+
+
+        stage('Publish Backend Artifact to Nexus') {
+            environment {
+                NEXUS_CREDS = credentials('nexus-creds')
+            }
+            steps {
+                sh """
+                curl -f -u ${NEXUS_CREDS_USR}:${NEXUS_CREDS_PSW} \
+                  --upload-file ${BACKEND_DIR}/nodejs-backend-${BUILD_NUMBER}.tar.gz \
+                  ${NEXUS_URL}/repository/${NEXUS_REPO}/nodejs-backend-${BUILD_NUMBER}.tar.gz
+                """
+            }
+        }
+
+        stage('Build Docker Image (Backend)') {
+            steps {
+                dir("${BACKEND_DIR}") {
+                    sh """
+                    docker build \
+                      -t ${ACR_NAME}/${IMAGE_NAME}:${IMAGE_TAG} .
+                    """
+                }
+            }
+        }
+
+      stage('Trivy Image Scan') {
+    steps {
+        sh """
+        trivy image ${ACR_NAME}/${IMAGE_NAME}:${IMAGE_TAG} \
+          --severity HIGH,CRITICAL \
+          --scanners vuln \
+          --format template \
+          --template "@trivy-templates/html.tpl" \
+          -o trivy-image-backend.html
+        """
+    }
+}
+
+
+        stage('Push Image to ACR') {
+            steps {
+                withDockerRegistry(
+                    credentialsId: 'acrcred',
+                    url: "https://${ACR_NAME}"
+                ) {
+                    sh "docker push ${ACR_NAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: '*.html, **/*.tar.gz'
+            cleanWs()
+        }
+    }
+}
